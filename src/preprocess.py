@@ -7,7 +7,7 @@ Per-rebalance-date cross-sectional preprocessing:
 """
 import pandas as pd
 import numpy as np
-from config import DATA_FEATURES, DATA_PROCESSED, ALL_FEATURES
+from config import DATA_FEATURES, DATA_PROCESSED, ALL_FEATURES, ANALYST_FEATURES
 
 
 def winsorize_cross_section(df: pd.DataFrame, features: list, lo=0.01, hi=0.99) -> pd.DataFrame:
@@ -75,16 +75,21 @@ def fill_missing_with_median(df: pd.DataFrame, features: list) -> pd.DataFrame:
 def build_feature_panel() -> pd.DataFrame:
     """Merge all feature files and apply preprocessing."""
     print("Loading feature files...")
-    price = pd.read_parquet(DATA_FEATURES / "features_price.parquet")
-    risk  = pd.read_parquet(DATA_FEATURES / "features_risk.parquet")
-    fund  = pd.read_parquet(DATA_FEATURES / "features_fundamental.parquet")
-    rough = pd.read_parquet(DATA_FEATURES / "features_rough_vol.parquet")
+    price    = pd.read_parquet(DATA_FEATURES / "features_price.parquet")
+    risk     = pd.read_parquet(DATA_FEATURES / "features_risk.parquet")
+    fund     = pd.read_parquet(DATA_FEATURES / "features_fundamental.parquet")
+    rough    = pd.read_parquet(DATA_FEATURES / "features_rough_vol.parquet")
+    analyst_path = DATA_FEATURES / "features_analyst.parquet"
+    analyst  = pd.read_parquet(analyst_path) if analyst_path.exists() else None
 
     universe = pd.read_parquet(DATA_PROCESSED / "universe.parquet")
 
     # Merge all
     df = universe[["date", "permno", "mktcap"]].copy()
-    for feat_df in [price, risk, fund, rough]:
+    feat_dfs = [price, risk, fund, rough]
+    if analyst is not None:
+        feat_dfs.append(analyst)
+    for feat_df in feat_dfs:
         cols = ["date", "permno"] + [c for c in feat_df.columns if c not in ("date", "permno")]
         df = df.merge(feat_df[cols], on=["date", "permno"], how="left")
 

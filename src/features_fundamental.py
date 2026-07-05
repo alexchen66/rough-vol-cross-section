@@ -53,8 +53,27 @@ def build_point_in_time_fundamentals(
     fundq["debt_to_equity"] = fundq["ltq"] / eps("ceqq")
     fundq["debt_to_assets"] = fundq["ltq"] / eps("atq")
 
+    # --- Earnings surprise (SUE) — PEAD signal ---
+    # SUE = (EPS_t - EPS_{t-4}) / rolling_std(EPS changes, 8 quarters)
+    # Positive SUE → market underreacts → stock drifts up (Post-Earnings Announcement Drift)
+    fundq["eps_chg"] = fundq["epspxq"] - fundq.groupby("permno")["epspxq"].shift(4)
+    eps_chg_std = fundq.groupby("permno")["eps_chg"].transform(
+        lambda x: x.rolling(8, min_periods=4).std()
+    )
+    fundq["sue"] = fundq["eps_chg"] / eps_chg_std.replace(0, np.nan)
+    # Winsorize SUE at ±5 to avoid distortion from penny-stock EPS
+    fundq["sue"] = fundq["sue"].clip(-5, 5)
+
+    # --- Accruals (earnings quality) ---
+    # accruals = (net income - EBITDA-based cash earnings proxy) / total assets
+    # EBITDA * (1 - tax_rate) ≈ operating cash flow before working capital
+    # Negative accruals (cash earnings > accounting earnings) → higher future returns
+    fundq["accruals"] = (
+        (fundq["niq"] - fundq["oibdpq"] * 0.65)
+        / eps("atq")
+    )
+
     # Store per-share values for later price-based ratios
-    # book_value_per_share, earnings_per_share, sales_per_share
     fundq["book_value_q"]  = fundq["ceqq"]
     fundq["earnings_q"]    = fundq["niq"]
     fundq["sales_q"]       = fundq["saleq"]
@@ -64,6 +83,7 @@ def build_point_in_time_fundamentals(
         "roe", "roa", "gross_profitability", "operating_margin",
         "revenue_growth", "earnings_growth", "asset_growth",
         "debt_to_equity", "debt_to_assets",
+        "sue", "accruals",
         "book_value_q", "earnings_q", "sales_q", "cshoq",
     ]
     return fundq[keep_cols].dropna(subset=["rdq"])
@@ -114,6 +134,7 @@ def merge_fundamentals_to_universe(
         "roe", "roa", "gross_profitability", "operating_margin",
         "revenue_growth", "earnings_growth", "asset_growth",
         "debt_to_equity", "debt_to_assets",
+        "sue", "accruals",
     ]
     return result[feature_cols]
 

@@ -34,6 +34,8 @@ PRICE_FEATURES = [
     "mom_12_1",
     "close_to_ma20", "close_to_ma60", "ma20_to_ma60",
     "price_position_252d",
+    "close_to_52w_high",   # George & Hwang (2004): near 52w high → positive
+    "max_ret_20d",         # Bali et al. (2011): lottery effect → negative
 ]
 RISK_FEATURES = [
     "rv_20d", "rv_60d", "rv_120d",
@@ -56,16 +58,27 @@ FUNDAMENTAL_FEATURES = [
     "revenue_growth",
     "debt_to_equity",
     "debt_to_assets",
+    "sue",       # Standardized Unexpected Earnings — PEAD signal
+    "accruals",  # Earnings quality: low accruals → higher future returns
 ]
 ROUGH_VOL_FEATURES = [
     "hurst_126d", "hurst_252d",
-    "roughness_126d", "roughness_252d",
     "vol_of_vol_60d", "vol_of_vol_126d",
     "idio_roughness_126d",
     "roughness_x_momentum",
     "roughness_x_illiquidity",
 ]
-ALL_FEATURES = PRICE_FEATURES + RISK_FEATURES + FUNDAMENTAL_FEATURES + ROUGH_VOL_FEATURES
+ANALYST_FEATURES = [
+    "sue_ibes",      # WRDS-computed SUE: (actual - consensus) / dispersion
+    "revision_1m",   # 1-month % change in consensus EPS estimate
+    "revision_3m",   # 3-month % change in consensus EPS estimate
+    "est_disp",      # analyst forecast dispersion (uncertainty)
+    "num_analysts",  # analyst coverage count
+]
+ALL_FEATURES = (
+    PRICE_FEATURES + RISK_FEATURES + FUNDAMENTAL_FEATURES
+    + ROUGH_VOL_FEATURES + ANALYST_FEATURES
+)
 
 # Portfolio
 LONG_ONLY_N = 50

@@ -65,10 +65,20 @@ def compute_price_features(
         rng > 0, (crsp["prc"] - crsp["low_252"]) / rng, np.nan
     )
 
+    # 52-week high ratio: price / 52w-high (George & Hwang 2004)
+    # Near 52-week high → anchoring bias → market underreacts → positive predictor
+    crsp["close_to_52w_high"] = crsp["prc"] / crsp["high_252"].replace(0, np.nan)
+
+    # MAX: largest single-day return over past 20 days (lottery-stock effect)
+    # High MAX → investors overpay for skewness → future underperformance (negative predictor)
+    crsp["max_ret_20d"] = crsp.groupby("permno")["ret"].transform(
+        lambda x: x.rolling(20, min_periods=15).max()
+    )
+
     feature_cols = [
         "ret_1d", "ret_5d", "ret_20d", "ret_60d", "ret_120d", "ret_252d",
         "mom_12_1", "close_to_ma20", "close_to_ma60", "ma20_to_ma60",
-        "price_position_252d",
+        "price_position_252d", "close_to_52w_high", "max_ret_20d",
     ]
 
     # Extract only on rebalance dates in universe

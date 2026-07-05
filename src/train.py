@@ -18,10 +18,9 @@ def get_feature_cols(df: pd.DataFrame) -> list:
     return base + flag_cols
 
 
-def add_embargo(train_end: str, embargo_days: int, trading_dates: pd.DatetimeIndex) -> pd.Timestamp:
-    """Return the first date to use for validation after embargo."""
-    t_end = pd.Timestamp(train_end)
-    idx = trading_dates.searchsorted(t_end)
+def add_embargo(train_end: str, embargo_days: int, trading_dates) -> str:
+    """Return the first date string to use for validation after embargo."""
+    idx = np.searchsorted(trading_dates, train_end[:10], side="right")
     embargo_idx = min(idx + embargo_days, len(trading_dates) - 1)
     return trading_dates[embargo_idx]
 
@@ -51,7 +50,7 @@ def run_walk_forward(
     data = data.sort_values(["date", "permno"]).reset_index(drop=True)
 
     feature_cols = get_feature_cols(data)
-    trading_dates = pd.DatetimeIndex(sorted(data["date"].unique()))
+    trading_dates = np.array(sorted(data["date"].str[:10].unique()))
 
     all_predictions = []
 
@@ -61,7 +60,7 @@ def run_walk_forward(
 
         # Embargo: shift val start forward
         embargo_start = add_embargo(tr_e, EMBARGO_DAYS, trading_dates)
-        actual_va_s = max(pd.Timestamp(va_s), embargo_start)
+        actual_va_s = max(va_s[:10], embargo_start)
 
         train = data[(data["date"] >= tr_s) & (data["date"] <= tr_e)].copy()
         val   = data[(data["date"] >= actual_va_s) & (data["date"] <= va_e)].copy()
@@ -109,8 +108,19 @@ def run_walk_forward(
         )
         test["score_ranker"] = lgbm_rank.predict(X_test)
 
+        # --- Ensemble: average Ridge + LGBM (after rank-normalising per date) ---
+        # Rank-normalise each score to [0,1] cross-sectionally before averaging
+        # so that Ridge's linear scale and LGBM's tree scale are commensurate.
+        def _rank_norm(s):
+            return s.groupby(test["date"]).rank(pct=True)
+
+        test["score_ensemble"] = (
+            0.3 * _rank_norm(test["score_ridge"]) + 0.7 * _rank_norm(test["score_lgbm"])
+        )
+
         all_predictions.append(
-            test[["date", "permno", "score_ridge", "score_lgbm", "score_ranker",
+            test[["date", "permno",
+                  "score_ridge", "score_lgbm", "score_ranker", "score_ensemble",
                   label_col, rank_label_col]].copy()
         )
 
