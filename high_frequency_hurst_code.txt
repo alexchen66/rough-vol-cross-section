@@ -1,0 +1,228 @@
+﻿# -*- coding: utf-8 -*-
+# ============================================================
+# High-frequency realized volatility roughness / Hurst indicator
+# ============================================================
+#
+# Purpose:
+# This script shows how to compute a rough-volatility H indicator from
+# high-frequency equity data. The core idea is:
+#
+#   1. Convert intraday high-frequency prices into daily realized volatility.
+#   2. Estimate the Hurst exponent H from the scaling law of log realized volatility.
+#   3. Define roughness = 0.5 - H.
+#
+# Interpretation:
+#   - Smaller H means the volatility path is rougher.
+#   - H < 0.5 is usually interpreted as rough volatility.
+#   - roughness = 0.5 - H is larger when the volatility curve is rougher.
+#
+# Required input data format:
+#   A CSV file with at least these columns:
+#     symbol      stock ticker or stock id
+#     timestamp   intraday timestamp, for example 2023-01-03 09:31:00
+#     price       trade price or mid price
+#
+# Recommended frequency:
+#   Use 1-minute or 5-minute bars if possible. Tick data should usually be
+#   cleaned and resampled first to avoid microstructure noise.
+#
+# Output:
+#   A daily panel with columns:
+#     symbol, date, realized_vol, log_rv, hurst_126d, roughness_126d
+#
+
+import numpy as np
+import pandas as pd
+
+
+# ------------------------------------------------------------
+# Step 1. Load high-frequency data
+# ------------------------------------------------------------
+# Replace this path with your own high-frequency data path.
+# The input should contain symbol, timestamp, and price.
+
+INPUT_CSV = "high_frequency_prices.csv"
+OUTPUT_CSV = "daily_roughness_features.csv"
+
+hf = pd.read_csv(INPUT_CSV)
+hf["timestamp"] = pd.to_datetime(hf["timestamp"])
+hf = hf.sort_values(["symbol", "timestamp"])
+
+
+# ------------------------------------------------------------
+# Step 2. Optional: resample to fixed intraday bars
+# ------------------------------------------------------------
+# If your input is already 1-minute or 5-minute bar data, you can skip this
+# function and directly use the price column.
+#
+# For noisy tick data, resampling is recommended. The example below uses the
+# last price within each 5-minute interval.
+
+
+def resample_intraday_bars(df, freq="5min"):
+    df = df.copy()
+    df = df.set_index("timestamp")
+
+    out = (
+        df.groupby("symbol")
+        .resample(freq)["price"]
+        .last()
+        .dropna()
+        .reset_index()
+    )
+    return out
+
+
+bars = resample_intraday_bars(hf, freq="5min")
+
+
+# ------------------------------------------------------------
+# Step 3. Compute daily realized volatility
+# ------------------------------------------------------------
+# Realized variance is the sum of squared intraday log returns:
+#
+#   RV_t = sum_i r_{t,i}^2
+#
+# Realized volatility is sqrt(RV_t).
+# Here we compute it for each stock and each trading day.
+
+
+def compute_daily_realized_volatility(bars):
+    bars = bars.copy()
+    bars["date"] = bars["timestamp"].dt.date
+
+    # Intraday log returns are computed within each symbol and each day.
+    bars["log_price"] = np.log(bars["price"])
+    bars["intraday_ret"] = (
+        bars.groupby(["symbol", "date"])["log_price"].diff()
+    )
+
+    daily = (
+        bars.dropna(subset=["intraday_ret"])
+        .assign(intraday_ret_sq=lambda x: x["intraday_ret"] ** 2)
+        .groupby(["symbol", "date"], as_index=False)["intraday_ret_sq"]
+        .sum()
+        .rename(columns={"intraday_ret_sq": "realized_var"})
+    )
+
+    daily["realized_vol"] = np.sqrt(daily["realized_var"])
+
+    # A small epsilon avoids log(0), which can happen for illiquid stocks.
+    eps = 1e-12
+    daily["log_rv"] = np.log(daily["realized_vol"] + eps)
+    daily["date"] = pd.to_datetime(daily["date"])
+    return daily
+
+
+daily_rv = compute_daily_realized_volatility(bars)
+
+
+# ------------------------------------------------------------
+# Step 4. Estimate Hurst exponent H from log realized volatility
+# ------------------------------------------------------------
+# We estimate H using the scaling law:
+#
+#   E[ |X_{t+lag} - X_t|^q ] ~ lag^(qH)
+#
+# Taking logs gives:
+#
+#   log E[ |X_{t+lag} - X_t|^q ] = constant + qH * log(lag)
+#
+# Therefore:
+#
+#   H = slope / q
+#
+# where X is usually log realized volatility.
+#
+# q=2 is common and stable. q=1 is sometimes more robust.
+
+
+def estimate_hurst_from_series(x, lags=(1, 2, 3, 5, 10, 20), q=2):
+    x = pd.Series(x).dropna().astype(float).values
+
+    moments = []
+    valid_lags = []
+
+    for lag in lags:
+        if len(x) <= lag:
+            continue
+
+        diff = np.abs(x[lag:] - x[:-lag])
+        moment = np.mean(diff ** q)
+
+        if np.isfinite(moment) and moment > 0:
+            moments.append(moment)
+            valid_lags.append(lag)
+
+    # Need at least three lag points to fit a meaningful slope.
+    if len(moments) < 3:
+        return np.nan
+
+    log_lags = np.log(np.array(valid_lags, dtype=float))
+    log_moments = np.log(np.array(moments, dtype=float))
+
+    slope, intercept = np.polyfit(log_lags, log_moments, 1)
+    hurst = slope / q
+    return hurst
+
+
+# ------------------------------------------------------------
+# Step 5. Rolling H indicator for each stock
+# ------------------------------------------------------------
+# The rolling window should be long enough to estimate H robustly.
+# 126 trading days roughly means half a year.
+# 252 trading days roughly means one year.
+#
+# If your universe is illiquid or data quality is noisy, prefer a longer
+# rolling window or 5-minute bars instead of 1-minute bars.
+
+
+def add_rolling_hurst_features(
+    daily,
+    window=126,
+    lags=(1, 2, 3, 5, 10, 20),
+    q=2,
+    min_periods=80,
+):
+    daily = daily.copy()
+    daily = daily.sort_values(["symbol", "date"])
+
+    hurst_col = f"hurst_{window}d"
+    rough_col = f"roughness_{window}d"
+
+    def rolling_hurst_for_one_symbol(s):
+        return s.rolling(window=window, min_periods=min_periods).apply(
+            lambda arr: estimate_hurst_from_series(arr, lags=lags, q=q),
+            raw=False,
+        )
+
+    daily[hurst_col] = (
+        daily.groupby("symbol", group_keys=False)["log_rv"]
+        .apply(rolling_hurst_for_one_symbol)
+    )
+
+    # Higher roughness means lower H and therefore rougher volatility.
+    daily[rough_col] = 0.5 - daily[hurst_col]
+    return daily
+
+
+features = add_rolling_hurst_features(
+    daily_rv,
+    window=126,
+    lags=(1, 2, 3, 5, 10, 20),
+    q=2,
+    min_periods=80,
+)
+
+
+# ------------------------------------------------------------
+# Step 6. Save daily rough volatility features
+# ------------------------------------------------------------
+# These features can be merged into the project feature panel by symbol/date.
+# In the current project, the corresponding feature names are similar to:
+#   hurst_126d, hurst_252d, roughness_126d, roughness_252d
+
+features.to_csv(OUTPUT_CSV, index=False)
+
+print(f"Saved rough volatility features to {OUTPUT_CSV}")
+print(features.tail())

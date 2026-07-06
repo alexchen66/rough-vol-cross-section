@@ -1,10 +1,10 @@
 """
-Model wrappers: Ridge, LGBMRegressor, LGBMRanker.
+Model wrappers: Ridge, ElasticNet, LGBMRegressor, LGBMRanker.
 Each exposes a uniform fit / predict interface.
 """
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.preprocessing import StandardScaler
 from lightgbm import LGBMRegressor, LGBMRanker
 
@@ -14,6 +14,28 @@ class RidgeModel:
         self.alpha = alpha
         self.scaler = StandardScaler()
         self.model  = Ridge(alpha=alpha)
+
+    def fit(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
+        X_scaled = self.scaler.fit_transform(X_train)
+        self.model.fit(X_scaled, y_train)
+        return self
+
+    def predict(self, X):
+        return self.model.predict(self.scaler.transform(X))
+
+
+class ElasticNetModel:
+    def __init__(self, alpha=0.001, l1_ratio=0.2, max_iter=5000):
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.scaler = StandardScaler()
+        self.model = ElasticNet(
+            alpha=alpha,
+            l1_ratio=l1_ratio,
+            max_iter=max_iter,
+            random_state=42,
+            selection="cyclic",
+        )
 
     def fit(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
         X_scaled = self.scaler.fit_transform(X_train)
