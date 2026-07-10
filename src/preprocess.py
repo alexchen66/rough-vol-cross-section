@@ -79,14 +79,18 @@ def build_feature_panel() -> pd.DataFrame:
     risk     = pd.read_parquet(DATA_FEATURES / "features_risk.parquet")
     fund     = pd.read_parquet(DATA_FEATURES / "features_fundamental.parquet")
     rough    = pd.read_parquet(DATA_FEATURES / "features_rough_vol.parquet")
-    analyst_path = DATA_FEATURES / "features_analyst.parquet"
-    analyst  = pd.read_parquet(analyst_path) if analyst_path.exists() else None
+    analyst_path  = DATA_FEATURES / "features_analyst.parquet"
+    rough_v2_path = DATA_FEATURES / "features_rough_vol_v2.parquet"
+    analyst  = pd.read_parquet(analyst_path)  if analyst_path.exists()  else None
+    rough_v2 = pd.read_parquet(rough_v2_path) if rough_v2_path.exists() else None
 
     universe = pd.read_parquet(DATA_PROCESSED / "universe.parquet")
 
     # Merge all
     df = universe[["date", "permno", "mktcap"]].copy()
     feat_dfs = [price, risk, fund, rough]
+    if rough_v2 is not None:
+        feat_dfs.append(rough_v2)
     if analyst is not None:
         feat_dfs.append(analyst)
     for feat_df in feat_dfs:

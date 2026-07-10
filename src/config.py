@@ -68,6 +68,15 @@ ROUGH_VOL_FEATURES = [
     "roughness_x_momentum",
     "roughness_x_illiquidity",
 ]
+# BRSS-like features using Garman-Klass daily RV (zero window overlap)
+# Replaces rv_20d-based Hurst which had 95% adjacent-window overlap
+ROUGH_VOL_V2_FEATURES = [
+    "gk_vol",             # Garman-Klass daily volatility (independent each day)
+    "hurst_gk_126d",      # BRSS-like H: log-log regression lag=1..10, 126d window
+    "hurst_gk_252d",      # same, 252d window
+    "roughness_gk_126d",  # 0.5 - hurst_gk_126d
+    "roughness_gk_252d",  # 0.5 - hurst_gk_252d
+]
 ANALYST_FEATURES = [
     "sue_ibes",      # WRDS-computed SUE: (actual - consensus) / dispersion
     "revision_1m",   # 1-month % change in consensus EPS estimate
@@ -77,7 +86,7 @@ ANALYST_FEATURES = [
 ]
 ALL_FEATURES = (
     PRICE_FEATURES + RISK_FEATURES + FUNDAMENTAL_FEATURES
-    + ROUGH_VOL_FEATURES + ANALYST_FEATURES
+    + ROUGH_VOL_FEATURES + ROUGH_VOL_V2_FEATURES + ANALYST_FEATURES
 )
 
 # Portfolio
