@@ -51,25 +51,28 @@ def compute_forward_returns(
 
         permnos = universe[universe["date"] == rebal_date]["permno"].values
 
-        entry_prices = (
+        # Use cumulative return (from ret, which includes dividends + DLRET)
+        # r_fwd = cum_ret(exit) / cum_ret(entry) - 1
+        # This correctly handles dividends and delisting returns.
+        entry_data = (
             crsp[crsp["date"] == entry_date]
-            .set_index("permno")[["prc", "siccd"]]
+            .set_index("permno")[["cum_ret", "siccd"]]
         )
-        exit_prices = (
+        exit_cum = (
             crsp[crsp["date"] == exit_date]
-            .set_index("permno")["prc"]
+            .set_index("permno")["cum_ret"]
         )
 
-        df = entry_prices.loc[entry_prices.index.isin(permnos)].copy()
-        df["prc_exit"] = exit_prices
-        df = df.dropna(subset=["prc", "prc_exit"])
-        df = df[df["prc"] > 0]
+        df = entry_data.loc[entry_data.index.isin(permnos)].copy()
+        df["cum_ret_exit"] = exit_cum
+        df = df.dropna(subset=["cum_ret", "cum_ret_exit"])
+        df = df[df["cum_ret"] > 0]
 
-        df["r_fwd"] = df["prc_exit"] / df["prc"] - 1
+        df["r_fwd"] = df["cum_ret_exit"] / df["cum_ret"] - 1
         df["date"]  = rebal_date
         df = df.reset_index()
 
-        records.append(df[["date", "permno", "r_fwd", "siccd"]])
+        records.append(df[["date", "permno", "r_fwd", "siccd"]].copy())
 
     labels = pd.concat(records, ignore_index=True)
 

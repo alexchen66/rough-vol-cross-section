@@ -25,6 +25,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from config import DATA_RAW, DATA_PROCESSED, DATA_FEATURES
 
 LAG_GRID = np.arange(1, 11)   # ell = 1,...,10 per BRSS
+# WLS note: lag 1-2 are most contaminated by daily measurement noise (nugget).
+# We upweight larger lags in WLS to reduce this downward H bias.
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -50,15 +52,35 @@ def compute_gk_vol(ohlc: pd.DataFrame) -> pd.DataFrame:
 
     Returns daily DataFrame with columns: permno, date, gk_vol
     Each row is fully independent — no rolling window overlap.
+
+    Note on CRSP fields: askhi/bidlo are ask-high / bid-low (quote-based),
+    not pure trade high/low. This means GK captures some bid-ask spread,
+    especially for illiquid stocks. We report the OHLC consistency failure
+    rate as a diagnostic but do not filter on it — filtering would
+    systematically exclude low-liquidity stocks and change the sample.
     """
     df = ohlc.copy()
 
-    # Need positive prices for log
+    # Require positive prices for log
     valid = (
         (df["bidlo"] > 0) & (df["askhi"] > 0) &
         (df["openprc"] > 0) & (df["prc"] > 0) &
         (df["askhi"] >= df["bidlo"])
     )
+
+    # OHLC consistency check: H >= max(O,C) and L <= min(O,C)
+    # Violations indicate quote-based extremes exceed close/open prices —
+    # expected in CRSP's ask-high/bid-low fields, but worth diagnosing.
+    high_ok = df["askhi"] >= df[["openprc", "prc"]].max(axis=1)
+    low_ok  = df["bidlo"]  <= df[["openprc", "prc"]].min(axis=1)
+    ohlc_consistent = high_ok & low_ok
+    n_total = len(df)
+    n_valid = valid.sum()
+    n_consistent = (valid & ohlc_consistent).sum()
+    print(f"  GK OHLC QC: {n_valid/n_total:.1%} pass price filter, "
+          f"{n_consistent/n_valid:.1%} of those pass H>=max(O,C) & L<=min(O,C)", flush=True)
+    print(f"  (violations expected: CRSP askhi/bidlo are quote-based, not pure trade H/L)", flush=True)
+
     df = df[valid].copy()
 
     log_hl = np.log(df["askhi"] / df["bidlo"])
@@ -74,58 +96,96 @@ def compute_gk_vol(ohlc: pd.DataFrame) -> pd.DataFrame:
 
 # ── Step 2: BRSS-like Hurst estimation ───────────────────────────────────────
 
-def estimate_hurst_brss(log_vol: np.ndarray, lag_grid: np.ndarray = LAG_GRID) -> float:
+def estimate_hurst_wls(log_vol: np.ndarray, lag_grid: np.ndarray = LAG_GRID) -> tuple:
     """
-    BRSS eq: log z_2(ell) = beta1 + beta2 * log(ell)
-    H = beta2 / 2
+    BRSS log-log regression with WLS to reduce nugget (measurement noise) bias.
+      E[M2(lag)] ≈ nugget + c * lag^(2H)
+    Ordinary OLS gives too much weight to small lags where the nugget dominates,
+    mechanically pushing H toward 0. WLS with w ∝ lag upweights large lags
+    that are less affected by daily GK measurement noise.
 
-    log_vol: 1-D array of log(gk_vol), no NaN, sorted by date
-    Returns H or NaN if insufficient data.
+    Returns: (H, se_H, r2)
+      H    — Hurst exponent estimate
+      se_H — approximate std error of H
+      r2   — R² of the log-log fit
     """
     T = len(log_vol)
     if T < lag_grid.max() + 5:
-        return np.nan
+        return np.nan, np.nan, np.nan
 
     z2 = np.array([
         np.mean((log_vol[ell:] - log_vol[:-ell])**2)
         for ell in lag_grid
     ])
 
-    # log-log regression
     log_ell = np.log(lag_grid.astype(float))
     log_z2  = np.log(z2 + 1e-30)
 
-    # Simple OLS slope
-    x = log_ell - log_ell.mean()
-    y = log_z2  - log_z2.mean()
-    beta2 = (x * y).sum() / (x * x).sum()
+    # WLS: weight proportional to lag (larger lag → less nugget contamination)
+    w = lag_grid.astype(float)
+    w = w / w.sum()
 
-    return beta2 / 2.0
+    x_mean = (w * log_ell).sum()
+    y_mean = (w * log_z2).sum()
+    xc = log_ell - x_mean
+    yc = log_z2  - y_mean
+
+    beta2 = (w * xc * yc).sum() / ((w * xc**2).sum() + 1e-30)
+
+    resid = yc - beta2 * xc
+    ss_res = (w * resid**2).sum()
+    ss_tot = (w * yc**2).sum()
+    r2 = float(1 - ss_res / (ss_tot + 1e-30))
+
+    # Approx SE: sqrt(MSE / Sxx) where MSE uses df = n-2
+    n = len(lag_grid)
+    mse = ss_res / max(n - 2, 1)
+    se_beta2 = np.sqrt(mse / ((w * xc**2).sum() + 1e-30))
+
+    return beta2 / 2.0, se_beta2 / 2.0, r2
 
 
-def compute_hurst_rolling(gk: pd.DataFrame, window: int) -> pd.Series:
+def estimate_hurst_brss(log_vol: np.ndarray, lag_grid: np.ndarray = LAG_GRID) -> float:
+    """OLS version kept for backward compatibility. Prefer estimate_hurst_wls."""
+    h, _, _ = estimate_hurst_wls(log_vol, lag_grid)
+    return h
+
+
+def compute_hurst_rolling(gk: pd.DataFrame, window: int) -> pd.DataFrame:
     """
-    For each permno, compute monthly BRSS-like H using a rolling window
+    For each permno, compute monthly BRSS-like H (WLS) using a rolling window
     of `window` trading days of log(gk_vol).
+    Also stores SE and R² per estimate for diagnostic reporting.
     """
     gk = gk.sort_values(["permno", "date"]).copy()
     gk["log_gk"] = np.log(gk["gk_vol"].replace(0, np.nan))
+
+    hcol  = f"hurst_gk_{window}d"
+    secol = f"hurst_gk_{window}d_se"
+    r2col = f"hurst_gk_{window}d_r2"
 
     results = []
     for permno, g in gk.groupby("permno"):
         g = g.dropna(subset=["log_gk"]).copy()
         log_v = g["log_gk"].values
-        dates  = g["date"].values
         n = len(log_v)
 
-        h_vals = np.full(n, np.nan)
+        h_vals  = np.full(n, np.nan)
+        se_vals = np.full(n, np.nan)
+        r2_vals = np.full(n, np.nan)
+
         for i in range(window - 1, n):
             window_vals = log_v[max(0, i - window + 1): i + 1]
-            h_vals[i] = estimate_hurst_brss(window_vals)
+            h, se, r2 = estimate_hurst_wls(window_vals)
+            h_vals[i]  = h
+            se_vals[i] = se
+            r2_vals[i] = r2
 
         g = g.copy()
-        g[f"hurst_gk_{window}d"] = h_vals
-        results.append(g[["permno", "date", f"hurst_gk_{window}d"]])
+        g[hcol]  = h_vals
+        g[secol] = se_vals
+        g[r2col] = r2_vals
+        results.append(g[["permno", "date", hcol, secol, r2col]])
 
     return pd.concat(results, ignore_index=True)
 
@@ -210,29 +270,54 @@ def main():
     print("Merging H estimates...", flush=True)
     hurst = hurst_126.merge(hurst_252, on=["permno", "date"], how="outer")
     hurst = hurst.merge(gk, on=["permno", "date"], how="outer")
-    hurst["roughness_gk_126d"] = (0.5 - hurst["hurst_gk_126d"]).clip(-0.5, 0.5)
-    hurst["roughness_gk_252d"] = (0.5 - hurst["hurst_gk_252d"]).clip(-0.5, 0.5)
+
+    # Diagnostic: H > 0.5 proportion (rough volatility theory focuses on H < 0.5)
+    h126 = hurst["hurst_gk_126d"].dropna()
+    h252 = hurst["hurst_gk_252d"].dropna()
+    print(f"  H_126d: mean={h126.mean():.3f}, std={h126.std():.3f}, "
+          f">0.5: {(h126>0.5).mean():.1%}, <0: {(h126<0).mean():.1%}", flush=True)
+    print(f"  H_252d: mean={h252.mean():.3f}, std={h252.std():.3f}, "
+          f">0.5: {(h252>0.5).mean():.1%}, <0: {(h252<0).mean():.1%}", flush=True)
+
+    r2_126 = hurst["hurst_gk_126d_r2"].dropna()
+    r2_252 = hurst["hurst_gk_252d_r2"].dropna()
+    print(f"  Log-log R²: 126d mean={r2_126.mean():.3f}, 252d mean={r2_252.mean():.3f}", flush=True)
+
+    # Note: roughness_gk = 0.5 - hurst_gk is a perfect affine transform (correlation = -1).
+    # We omit roughness_gk columns from the output to avoid feeding perfectly
+    # collinear features into the model. hurst_gk is the canonical signal.
+
 
     print("Loading universe...", flush=True)
     universe = load_parquet(DATA_PROCESSED / "universe.parquet",
                             columns=["date", "permno"])
     universe["date"] = universe["date"].str[:10]
 
-    feat_cols = ["gk_vol", "hurst_gk_126d", "hurst_gk_252d",
-                 "roughness_gk_126d", "roughness_gk_252d"]
+    # Only store hurst + diagnostics; roughness_gk = 0.5 - hurst_gk is redundant.
+    feat_cols = [
+        "gk_vol",
+        "hurst_gk_126d", "hurst_gk_126d_se", "hurst_gk_126d_r2",
+        "hurst_gk_252d", "hurst_gk_252d_se", "hurst_gk_252d_r2",
+    ]
 
     print("Merging to universe rebalance dates...", flush=True)
     out = merge_to_universe(hurst, universe, feat_cols)
 
-    for c in feat_cols:
+    for c in ["gk_vol", "hurst_gk_126d", "hurst_gk_252d"]:
         cov = out[c].notna().mean()
         print(f"  Coverage {c}: {cov:.1%}", flush=True)
+
+    # Save SE/R² summary to reports for diagnostics
+    diag_path = DATA_FEATURES.parent / "reports" / "hurst_gk_diagnostics.csv"
+    diag_path.parent.mkdir(exist_ok=True)
+    diag = out[["hurst_gk_126d", "hurst_gk_126d_se", "hurst_gk_126d_r2",
+                 "hurst_gk_252d", "hurst_gk_252d_se", "hurst_gk_252d_r2"]].describe()
+    diag.to_csv(diag_path)
+    print(f"  Saved diagnostics to {diag_path}", flush=True)
 
     out_path = DATA_FEATURES / "features_rough_vol_v2.parquet"
     pq.write_table(pa.Table.from_pandas(out), out_path)
     print(f"\nSaved {out_path} — {len(out):,} rows", flush=True)
-
-    print("\nNext: add these features to config.py and re-run preprocess + train")
 
 
 if __name__ == "__main__":

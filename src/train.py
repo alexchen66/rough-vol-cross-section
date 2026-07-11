@@ -1,10 +1,17 @@
 """
 Walk-forward training with embargo.
 Trains Ridge, LGBMRegressor, and LGBMRanker on rolling windows.
+
+Statistical note: effective sample size is ~93 independent months, not the
+number of stock-month rows. HAC (Newey-West) t-stats are computed on the
+monthly IC series to properly account for time-series autocorrelation.
+Date-balanced sample weights (1/N_stocks_per_date) give each month equal
+influence on the loss, preventing high-stock-count months from dominating.
 """
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from scipy import stats as scipy_stats
 from config import (
     DATA_FEATURES, DATA_PROCESSED, ALL_FEATURES,
     WALK_FORWARD_WINDOWS, EMBARGO_DAYS,
@@ -28,6 +35,40 @@ def add_embargo(train_end: str, embargo_days: int, trading_dates) -> str:
 def make_group_array(df: pd.DataFrame) -> np.ndarray:
     """Number of stocks per rebalance date, in sorted date order."""
     return df.groupby("date").size().sort_index().values
+
+
+def make_date_weights(df: pd.DataFrame) -> np.ndarray:
+    """
+    Date-balanced sample weights: each calendar month contributes equally
+    to the loss, regardless of how many stocks are in the universe that month.
+    weight_i = 1 / N_stocks_on_date_i
+    """
+    n_per_date = df.groupby("date")["permno"].transform("count").values
+    return 1.0 / n_per_date.astype(float)
+
+
+def newey_west_tstat(ic_series: np.ndarray, n_lags: int = 6) -> dict:
+    """
+    Newey-West HAC t-statistic for the mean of an IC time series.
+    Uses n_lags=6 (half-year) to capture overlapping-holding-period autocorrelation.
+    The 93 monthly observations are the effective sample size, not stock-month rows.
+    """
+    n = len(ic_series)
+    mu = ic_series.mean()
+    demeaned = ic_series - mu
+
+    # Newey-West sandwich variance estimator
+    gamma0 = np.dot(demeaned, demeaned) / n
+    nw_var = gamma0
+    for lag in range(1, n_lags + 1):
+        gamma_lag = np.dot(demeaned[lag:], demeaned[:-lag]) / n
+        nw_var += 2 * (1 - lag / (n_lags + 1)) * gamma_lag
+
+    se = np.sqrt(max(nw_var, 0) / n)
+    t  = mu / se if se > 1e-10 else 0.0
+    p  = 2 * (1 - scipy_stats.t.cdf(abs(t), df=max(n - 1, 1)))
+    return {"n_months": n, "ic_mean": float(mu), "ic_se_hac": float(se),
+            "t_stat_hac": float(t), "p_value_hac": float(p)}
 
 
 def run_walk_forward(
@@ -86,18 +127,21 @@ def run_walk_forward(
         group_train = make_group_array(train.sort_values("date"))
         group_val   = make_group_array(val.sort_values("date"))
 
+        # Date-balanced weights: each month gets equal total weight.
+        w_train = make_date_weights(train)
+        w_val   = make_date_weights(val)
+
         # --- Ridge ---
         print("  Fitting Ridge...")
         ridge = RidgeModel(alpha=1.0)
-        ridge.fit(X_train, y_train)
+        ridge.fit(X_train, y_train, sample_weight=w_train)
         test = test.copy()
         test["score_ridge"] = ridge.predict(X_test)
 
         # --- LGBMRegressor ---
         print("  Fitting LGBMRegressor...")
         lgbm_reg = LGBMRegressorModel()
-        lgbm_reg.fit(X_train, y_train, X_val, y_val)
-        test["score_lgbm"] = lgbm_reg.predict(X_test)
+        lgbm_reg.fit(X_train, y_train, X_val, y_val, sample_weight=w_train)
 
         # --- LGBMRanker ---
         print("  Fitting LGBMRanker...")
@@ -151,6 +195,40 @@ def _save_feature_importance(lgbm_reg, lgbm_rank, feature_cols):
     print("  Feature importances saved to reports/")
 
 
+def compute_and_save_hac_ic(predictions: pd.DataFrame):
+    """
+    Compute Newey-West HAC t-stats on the monthly Spearman Rank IC series.
+    Effective sample: ~93 months (not millions of stock-month rows).
+    """
+    from scipy.stats import spearmanr
+
+    out_dir = DATA_PROCESSED.parent / "reports"
+    out_dir.mkdir(exist_ok=True)
+
+    models = ["score_ridge", "score_lgbm", "score_ranker", "score_ensemble"]
+    label  = "y_xs"
+    rows = []
+
+    for model in models:
+        if model not in predictions.columns:
+            continue
+        monthly_ic = (
+            predictions.groupby("date")
+            .apply(lambda g: spearmanr(g[model], g[label])[0], include_groups=False)
+            .dropna()
+        )
+        stats = newey_west_tstat(monthly_ic.values, n_lags=6)
+        stats["model"] = model.replace("score_", "")
+        rows.append(stats)
+
+    hac_df = pd.DataFrame(rows)[
+        ["model", "n_months", "ic_mean", "ic_se_hac", "t_stat_hac", "p_value_hac"]
+    ]
+    hac_df.to_csv(out_dir / "ic_hac_tstat.csv", index=False)
+    print("\nNewey-West HAC IC t-stats (effective n ≈ 93 months):")
+    print(hac_df.to_string(index=False, float_format="{:.4f}".format))
+
+
 def main():
     print("Loading preprocessed features...")
     features = pd.read_parquet(DATA_FEATURES / "features_preprocessed.parquet")
@@ -164,6 +242,9 @@ def main():
     out = DATA_PROCESSED / "predictions.parquet"
     predictions.to_parquet(out, index=False)
     print(f"\nSaved {out} — {len(predictions):,} rows")
+
+    print("\nComputing HAC IC statistics...")
+    compute_and_save_hac_ic(predictions)
 
 
 if __name__ == "__main__":

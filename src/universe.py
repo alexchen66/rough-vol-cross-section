@@ -111,9 +111,17 @@ def apply_delisting_returns(
         right_on=["permno", "dlstdt"],
         how="left",
     )
-    # Where a delisting return exists, use it to fill missing ret
-    mask = crsp["dlret"].notna() & crsp["ret"].isna()
-    crsp.loc[mask, "ret"] = crsp.loc[mask, "dlret"]
+    # CRSP canonical DLRET treatment:
+    #   both present  → (1+RET)*(1+DLRET)-1  (compound)
+    #   only DLRET    → DLRET
+    #   neither       → leave as-is (may be NaN)
+    mask_both       = crsp["dlret"].notna() & crsp["ret"].notna()
+    mask_only_dlret = crsp["dlret"].notna() & crsp["ret"].isna()
+    crsp.loc[mask_both, "ret"] = (
+        (1 + crsp.loc[mask_both, "ret"]) *
+        (1 + crsp.loc[mask_both, "dlret"]) - 1
+    )
+    crsp.loc[mask_only_dlret, "ret"] = crsp.loc[mask_only_dlret, "dlret"]
     crsp = crsp.drop(columns=["dlstdt", "dlret"])
     return crsp
 

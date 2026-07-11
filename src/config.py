@@ -69,13 +69,14 @@ ROUGH_VOL_FEATURES = [
     "roughness_x_illiquidity",
 ]
 # BRSS-like features using Garman-Klass daily RV (zero window overlap)
-# Replaces rv_20d-based Hurst which had 95% adjacent-window overlap
+# Replaces rv_20d-based Hurst which had 95% adjacent-window overlap.
+# roughness_gk = 0.5 - hurst_gk is a perfect affine transform (Pearson r = -1
+# in the same sample after standardisation). Including both is exactly collinear;
+# we keep only hurst_gk as the canonical signal.
 ROUGH_VOL_V2_FEATURES = [
-    "gk_vol",             # Garman-Klass daily volatility (independent each day)
-    "hurst_gk_126d",      # BRSS-like H: log-log regression lag=1..10, 126d window
-    "hurst_gk_252d",      # same, 252d window
-    "roughness_gk_126d",  # 0.5 - hurst_gk_126d
-    "roughness_gk_252d",  # 0.5 - hurst_gk_252d
+    "gk_vol",          # Garman-Klass daily volatility (independent each day)
+    "hurst_gk_126d",   # BRSS-like H (WLS), 126d rolling window
+    "hurst_gk_252d",   # BRSS-like H (WLS), 252d rolling window
 ]
 ANALYST_FEATURES = [
     "sue_ibes",      # WRDS-computed SUE: (actual - consensus) / dispersion

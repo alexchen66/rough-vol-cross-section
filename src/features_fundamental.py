@@ -1,9 +1,12 @@
 """
 Fundamental features from Compustat quarterly data.
-Point-in-time alignment: use rdq (report/announcement date) not datadate.
+Point-in-time alignment: use rdq + 1 BDay (next trading day after announcement).
+RDQ is a date, not a timestamp — same-day announcements are often post-market.
+Using rdq+1 eliminates the ~1-day look-ahead bias from same-day RDQ.
 """
 import pandas as pd
 import numpy as np
+from pandas.tseries.offsets import BDay
 from config import DATA_RAW, DATA_PROCESSED, DATA_FEATURES
 
 
@@ -111,11 +114,15 @@ def merge_fundamentals_to_universe(
         .reset_index(drop=True)
     )
 
+    # date_available = next trading day after rdq:
+    # ensures same-day post-market announcements are not used on signal date.
+    right["date_available"] = right["date_rdq"].apply(lambda d: d + BDay(1))
+
     result = pd.merge_asof(
         left,
-        right,
+        right.sort_values("date_available"),
         left_on="date",
-        right_on="date_rdq",
+        right_on="date_available",
         by="permno",
         direction="backward",
     )
