@@ -1,0 +1,583 @@
+================================================================================
+截面股票 Alpha 挖掘系统 — 完整方案
+项目名称：Cross-Sectional Equity Alpha with Rough Volatility Features
+================================================================================
+
+一、项目概述
+────────────────────────────────────────────────────────────────────────────────
+本项目构建一套完整的美股截面多因子 Alpha 挖掘框架，核心目标是预测个股
+未来 20 个交易日的超额收益，并在此基础上构建多空策略进行回测。
+
+项目核心创新点在于将粗糙波动率（Rough Volatility）理论引入传统多因子体系：
+参考 Glasserman & He (2020) "Buy Rough, Sell Smooth" (BRSS) 的实证框架，
+用日度 Garman-Klass 方差估计量代替滚动标准差，通过 log-log 回归估计
+Hurst 指数，从而提取波动率的粗糙度（roughness）信号。
+
+回测期：2016–2023（共 93 个月度调仓日）
+标的范围：美国上市股票（CRSP 全量，过滤后约每期 3,200 只）
+调仓频率：月度（每月末）
+
+
+二、数据来源
+────────────────────────────────────────────────────────────────────────────────
+所有数据来自 WRDS 学术数据库，以 Parquet 格式存储于 data/raw/。
+
+1. CRSP Daily Stock File (crsp.dsf)
+   - 字段：permno, date, prc, ret, vol, shrout, siccd
+   - 覆盖：2004-01-02 ~ 2023-12-29
+   - 用途：价格/收益率特征、标签、流动性因子
+
+2. CRSP OHLC (crsp.dsf — askhi/bidlo/openprc 字段)
+   - 字段：permno, date, bidlo（最低价）, askhi（最高价）, openprc（开盘价）
+   - 行数：37,186,110 行，19,272 只股票
+   - 用途：Garman-Klass 日度波动率，解决 rv_20d 窗口重叠问题
+
+3. Compustat Fundamentals Quarterly (comp.fundq)
+   - 字段：gvkey, rdq, ceqq, epspxq, saleq, atq, ltq, niq, oibdpq
+   - 使用 rdq（财报公告日）确保 point-in-time 无前视
+   - 用途：基本面因子（B/M、盈利、杠杆等）
+
+4. CRSP-Compustat 联结表 (crsp.ccmxpf_linktable)
+   - 字段：permno, gvkey, linktype, linkdt, linkenddt
+   - 筛选 linktype ∈ {LC, LU}（主要链接类型）
+   - 用途：将 Compustat 财务数据与 CRSP 价格数据关联
+
+5. Fama-French 三因子（日度）
+   - 字段：date, mktrf, smb, hml, rf
+   - 用途：估计个股 beta、特质波动率
+
+6. I/B/E/S Summary Statistics（WRDS 下载）
+   - 字段：TICKER, STATPERS, MEANEST, STDEV, NUMEST, FPEDATS, FPI
+   - 覆盖：分析师一致预期、分歧、预测修正
+   - 用途：分析师修正动量、预期分歧特征
+
+7. I/B/E/S Surprise History（WRDS 下载）
+   - 字段：TICKER, anndats, actual, est, suescore, fpedats
+   - 覆盖：实际 EPS vs. 分析师预期，WRDS 预计算 SUE 分数
+   - 用途：标准化未预期盈余（SUE）信号
+
+
+三、股票池构建（universe.py）
+────────────────────────────────────────────────────────────────────────────────
+为消除生存偏差，股票池在每个调仓日独立构建：
+
+过滤条件（全部需同时满足）：
+  - prc > $5（排除低价股）
+  - 近 20 日平均美元成交量 > $100 万（排除流动性差的股票）
+  - 上市满 252 个交易日（排除新股）
+  - 当期有有效价格和收益率记录
+
+点位数据（Point-in-time）：
+  - 财务数据仅使用 rdq（公告日）之前已公开的数据
+  - 分析师数据仅使用 STATPERS（统计截止日）严格早于调仓日的记录
+  - OHLC 特征合并时使用 < rebalance_date 的最近记录
+
+
+四、标签构建（labels.py）
+────────────────────────────────────────────────────────────────────────────────
+目标变量：20 日前视截面超额收益
+
+计算方式：
+  1. 原始前视收益：r_fwd = P(t+21) / P(t+1) - 1
+     （t=调仓日，t+1 为入场日，t+21 为出场日）
+  2. 截面超额收益（主要标签）：
+     y_xs = r_fwd - median(r_fwd)  [日期内去中位化]
+  3. 行业中性化标签：
+     y_ind = r_fwd - median(r_fwd | SIC 2位行业)
+  4. 排名标签（LGBMRanker 用）：
+     rank_label = pd.qcut(r_fwd, q=10)  [0–9 十分位]
+
+注意：使用 P(t+1) 而非 P(t) 作为入场价，避免用当日收盘价直接入场的
+      执行偏差（execution bias）。
+
+
+五、特征工程
+────────────────────────────────────────────────────────────────────────────────
+共 54 个特征，分为 6 大类：
+
+5.1 价格动量特征（features_price.py）— 14 个
+────────────────────────────────────────────
+  ret_1d        — 1 日收益率（短期反转信号）
+  ret_5d        — 5 日收益率（周频动量）
+  ret_20d       — 20 日收益率（月频动量）
+  ret_60d       — 60 日收益率（季频动量）
+  ret_120d      — 120 日收益率（半年动量）
+  ret_252d      — 252 日收益率（年度动量）
+  mom_12_1      — 12个月动量跳过最近1个月 = ret_252d - ret_20d
+                  （Jegadeesh & Titman 1993 经典动量）
+  close_to_ma20 — 收盘价 / 20日均线 - 1（短期趋势跟踪）
+  close_to_ma60 — 收盘价 / 60日均线 - 1
+  ma20_to_ma60  — 20日均线 / 60日均线 - 1（趋势加速度）
+  price_position_252d — 过去252日中收盘价的分位数（价格位置）
+  close_to_52w_high   — 收盘价 / 过去252日最高价
+                        （George & Hwang 2004：接近52周高点→正预测）
+  max_ret_20d   — 过去20日单日最大收益（Bali 2011：彩票效应→负预测）
+
+5.2 风险特征（features_risk.py）— 12 个
+─────────────────────────────────────────
+  rv_20d        — 20日已实现波动率（日收益率滚动标准差）
+  rv_60d        — 60日已实现波动率
+  rv_120d       — 120日已实现波动率
+  downside_vol_60d — 60日下行波动率（仅负收益日）
+  beta_252d     — 252日 CAPM beta（vs. 市场因子，OLS 估计）
+  idio_vol_252d — 252日特质波动率（FF3 残差的年化标准差）
+  max_dd_60d    — 60日最大回撤
+  max_dd_252d   — 252日最大回撤
+  skew_60d      — 60日日收益率偏度
+  amihud_20d    — Amihud (2002) 非流动性 = |ret| / dollar_vol 的滚动均值
+  dollar_vol_20d — 20日平均美元成交量（流动性代理）
+  turnover_20d  — 20日换手率 = vol / shrout
+
+5.3 基本面特征（features_fundamental.py）— 12 个
+──────────────────────────────────────────────────
+  book_to_market    — 账面市值比 = ceqq / mktcap（价值因子）
+  earnings_yield    — 盈利收益率 = epspxq × 4 / prc（估值）
+  sales_to_price    — 销售收益率 = saleq × 4 / mktcap
+  roe               — 净资产收益率 = niq / ceqq
+  roa               — 资产收益率 = niq / atq
+  gross_profitability — 毛利 / 总资产（Novy-Marx 2013 盈利能力因子）
+  asset_growth      — 总资产同比增长率（Cooper 2008 资产增长异象→负预测）
+  revenue_growth    — 收入同比增长率
+  debt_to_equity    — 资产负债率 = ltq / ceqq（杠杆风险）
+  debt_to_assets    — 债务资产比 = ltq / atq
+  sue               — Compustat 自建 SUE：(EPS_t - EPS_{t-4}) / 滚动标准差
+                      （盈余惊喜，PEAD 效应）
+  accruals          — 应计项目 = (niq - oibdpq×0.65) / atq
+                      （盈利质量：低应计→高未来收益）
+
+5.4 粗糙波动率 V1 特征（features_rough_vol.py）— 7 个
+──────────────────────────────────────────────────────
+使用 rv_20d 滚动标准差为基础，通过 Whittle 估计量和 Volterra 核方法
+提取 Hurst 指数和粗糙度信号。
+
+  hurst_126d      — 126日 Whittle 估计 H（频域 MLE，最高统计效率）
+  hurst_252d      — 252日 Whittle 估计 H
+  vol_of_vol_60d  — log(rv_20d) 的 60日一阶差分标准差（波动率的波动率）
+  vol_of_vol_126d — 同上，126日窗口
+  idio_roughness_126d — 特质 Hurst：对 FF3 残差对数波动率估计的 H
+  roughness_x_momentum    — 粗糙度与动量的交叉项
+  roughness_x_illiquidity — 粗糙度与非流动性的交叉项
+
+  缺陷（由同学指出）：rv_20d 相邻窗口有 95% 重叠，
+  即 rv_20d(t) 与 rv_20d(t-1) 共享 19/20 的数据，
+  导致 log_rv 序列截面方差被严重压缩，粗糙度信号极弱。
+  单因子 IC ≈ 0.0039，ICIR ≈ 0.09。
+
+5.5 粗糙波动率 V2 特征（features_rough_vol_v2.py）— 5 个
+────────────────────────────────────────────────────────────
+参考 BRSS 原文方法，改用 Garman-Klass 日度估计量（每日独立，零窗口重叠）。
+
+  Garman-Klass 估计量（每日独立）：
+    sigma_GK^2 = 0.5 × [ln(H/L)]^2 - (2ln2-1) × [ln(C/O)]^2
+    每天只用当日 OHLC 数据，相邻两天完全独立。
+
+  BRSS log-log 回归估 H：
+    对每个 lag ell ∈ {1,...,10}，计算
+      z_2(ell) = E[(log_vol(t+ell) - log_vol(t))^2]
+    对 log(z_2) ~ log(ell) 做 OLS，斜率/2 = H
+
+  特征列表：
+  gk_vol          — Garman-Klass 日度波动率（vol proxy，替代 rv_20d）
+  hurst_gk_126d   — BRSS-like H（126日滚动窗口估计）
+  hurst_gk_252d   — BRSS-like H（252日滚动窗口估计）
+  roughness_gk_126d = 0.5 - hurst_gk_126d
+  roughness_gk_252d = 0.5 - hurst_gk_252d
+
+  改进效果：
+    H 均值：0.516 → 0.063（接近 BRSS 原文 ~0.1，粗糙波动率理论范围）
+    单因子 IC：0.0039 → 0.0131（提升 236%）
+    覆盖率：gk_vol 100%，hurst_gk_126d 97.3%，hurst_gk_252d 92.7%
+
+5.6 分析师特征（features_analyst.py）— 5 个
+─────────────────────────────────────────────
+数据来源：WRDS I/B/E/S Summary Statistics + Surprise History
+
+  Ticker 匹配链路：I/B/E/S OFTIC → Compustat tic → gvkey → permno
+  （通过 CRSP-Compustat Link Table，linktype ∈ {LC, LU}）
+
+  sue_ibes    — WRDS 预计算的 SUE 分数 = (actual - consensus) / dispersion
+                捕捉盈余惊喜，PEAD 效应核心信号
+                覆盖率：64%
+  revision_1m — 1个月分析师一致预期修正 = (MEANEST_t - MEANEST_{t-1}) / |denom|
+                分析师集体上调→正预测信号，覆盖率：~71%
+  revision_3m — 3个月修正，更慢更持久，覆盖率：~71%
+  est_disp    — 预测分歧度 = STDEV / |MEANEST|
+                高分歧 = 高不确定性，通常为负预测因子
+                覆盖率：65.8%
+  num_analysts — 分析师覆盖数量
+                低覆盖 = 信息不对称，与 alpha 正相关
+                覆盖率：71.5%
+
+
+六、数据预处理（preprocess.py）
+────────────────────────────────────────────────────────────────────────────────
+每个调仓日的截面独立处理，按以下顺序执行：
+
+Step 1：缺失值标记
+  对每个特征 f，生成 {f}_missing 二值标志列（0/1）
+  后续模型可以学习缺失模式本身的信息含义
+
+Step 2：截面中位数填充
+  用当期截面中位数填充缺失值
+  保证每个截面特征值完整，避免 NaN 传播
+
+Step 3：Winsorize（缩尾处理）
+  对每个截面在 1%/99% 分位数处截尾
+  消除极端值对 z-score 的污染
+
+Step 4：截面 z-score 标准化
+  z = (x - mean) / std
+  所有特征变为均值0、方差1的截面标准分
+
+Step 5：行业 + 市值中性化
+  对每个特征进行截面回归：
+    f_i = α + Σ β_k × IND_k(i) + γ × log(mktcap_i) + ε_i
+  用残差 ε_i 代替原始特征值
+  目的：分离出剥除行业和市值暴露后的纯净 alpha 信号
+
+
+七、模型架构
+────────────────────────────────────────────────────────────────────────────────
+
+7.1 Ridge 回归（线性基准）
+  损失：||Xβ - y||^2 + α||β||^2，α=1.0
+  优点：稳健、可解释、不过拟合
+  特征：需要 StandardScaler 预处理
+  预测目标：y_xs（截面超额收益）
+
+7.2 LGBMRegressor（主模型）
+  目标函数：MSE（回归）
+  参数：n_estimators=500, lr=0.05, num_leaves=63,
+        subsample=0.8, colsample_bytree=0.8
+        reg_alpha=0.1, reg_lambda=0.1
+  早停：在验证集上监控，patience=50
+  预测目标：y_xs（截面超额收益）
+
+7.3 LGBMRanker（排名模型）
+  目标函数：LambdaRank（listwise 排名学习）
+  评估指标：NDCG
+  Group 划分：按调仓日分组（每组为同一期股票池）
+  预测目标：rank_label（10 分位排名标签）
+  结果：表现不稳定，2021年严重负 IC，不纳入 Ensemble
+
+7.4 Ensemble 集成（最终模型）
+  score_ensemble = 0.3 × rank_norm(score_ridge)
+                 + 0.7 × rank_norm(score_lgbm)
+
+  先将 Ridge 和 LGBM 的分数各自在截面内转为百分位秩（rank pct），
+  再加权平均（70% LGBM + 30% Ridge）。
+
+  权重选择依据：
+    - LGBM 与 Ridge 的截面相关系数仅 0.391，说明两者互补
+    - Ridge 在激进市场下波动更大（std=0.0506 vs LGBM 0.0376）
+    - 70/30 权重在验证集上 Sharpe 最优
+
+
+八、Walk-Forward 验证框架（train.py）
+────────────────────────────────────────────────────────────────────────────────
+为避免 look-ahead bias，采用时序扩展窗口验证：
+
+8 个窗口，格式：训练7年 → 验证2年 → 测试1年，每年滚动一次
+  Window 1：train 2007-2013 | val 2014-2015 | test 2016
+  Window 2：train 2008-2014 | val 2015-2016 | test 2017
+  Window 3：train 2009-2015 | val 2016-2017 | test 2018
+  Window 4：train 2010-2016 | val 2017-2018 | test 2019
+  Window 5：train 2011-2017 | val 2018-2019 | test 2020
+  Window 6：train 2012-2018 | val 2019-2020 | test 2021
+  Window 7：train 2013-2019 | val 2020-2021 | test 2022
+  Window 8：train 2014-2020 | val 2021-2022 | test 2023
+
+Embargo（隔离期）：20 个交易日
+  训练集结束与验证集开始之间强制间隔 20 天，
+  避免短期自相关导致的验证集泄露。
+
+每个窗口独立训练三个模型，测试期预测拼接形成完整时间序列。
+
+
+九、组合构建与回测
+────────────────────────────────────────────────────────────────────────────────
+
+9.1 多空策略
+  Long：得分前 10% 的股票等权持有
+  Short：得分后 10% 的股票等权做空
+  再平衡：月度，调仓日为每月最后一个交易日
+  持仓期：20 个交易日
+
+9.2 交易成本测试
+  对 0 / 5 / 10 / 20 bps 单边交易成本分别测试
+  成本计算：net_ret = gross_ret - turnover × cost_rate
+
+9.3 评估指标
+  IC（信息系数）：每个调仓日，模型预测排名 vs. 实际收益排名的 Spearman 相关
+  ICIR：IC均值 / IC标准差（信号稳定性）
+  Hit Ratio：IC > 0 的月度比例
+  Sharpe Ratio：年化 Sharpe = 月度收益均值 / 月度收益标准差 × √12
+  最大回撤（Max Drawdown）
+  Calmar Ratio：年化收益 / |最大回撤|
+
+
+十、实验结果
+────────────────────────────────────────────────────────────────────────────────
+测试期：2016-2023，共 93 个月度调仓日（historical walk-forward pseudo-OOS）
+注意：测试期在研究方案迭代过程中已被部分观察，属于探索性研究（pseudo-OOS），
+      非严格意义上未触碰的样本外数据。结论需保留此限制。
+
+10.1 IC 统计（Spearman Rank IC）
+  ┌────────────┬────────┬────────┬───────┬────────────┐
+  │ 模型        │ IC均值 │ IC标准差│ ICIR  │ Hit Ratio  │
+  ├────────────┼────────┼────────┼───────┼────────────┤
+  │ Ridge      │ 0.0335 │ 0.1194 │ 0.280 │ 61.3%      │
+  │ LGBM       │ 0.0305 │ 0.1002 │ 0.305 │ 61.3%      │
+  │ LGBMRanker │ -0.0213│ 0.1470 │-0.145 │ 46.2%      │
+  │ Ensemble   │ 0.0351 │ 0.1193 │ 0.294 │ 62.4%      │
+  └────────────┴────────┴────────┴───────┴────────────┘
+
+10.2 Newey-West HAC IC t统计（有效样本 = 93 个月，而非百万行）
+  注：IC 正显著性应以月度 IC 时序为推断单位（~93 个相关月份），
+      而非独立的 stock-month 行数。HAC 使用 6 个月 lag 捕捉持仓期自相关。
+  ┌────────────┬─────────┬──────────┬────────────┬──────────────┐
+  │ 模型        │ IC均值  │ HAC标准误 │ HAC t值    │ p值          │
+  ├────────────┼─────────┼──────────┼────────────┼──────────────┤
+  │ Ridge      │ 0.0339  │ 0.0095   │  3.59      │ 0.0005 ***   │
+  │ LGBM       │ 0.0331  │ 0.0070   │  4.71      │ <0.0001 ***  │
+  │ LGBMRanker │ -0.0183 │ 0.0158   │ -1.16      │ 0.2503       │
+  │ Ensemble   │ 0.0363  │ 0.0080   │  4.55      │ <0.0001 ***  │
+  └────────────┴─────────┴──────────┴────────────┴──────────────┘
+  结论：Ridge 和 Ensemble 均在 0.1% 显著水平拒绝零假设（IC=0），
+        Ranker 不显著，已从 Ensemble 中排除。
+
+10.3 多空策略绩效（0 交易成本）
+  ┌────────────┬──────────┬─────────┬────────┬──────────┐
+  │ 模型        │ 月均收益 │ 年化波动 │ Sharpe │ 最大回撤 │
+  ├────────────┼──────────┼─────────┼────────┼──────────┤
+  │ Ridge      │  1.06%   │  17.3%  │  0.74  │  -18.1%  │
+  │ LGBM       │  1.30%   │  12.7%  │  1.23  │  -11.5%  │
+  │ Ensemble   │  1.36%   │  16.3%  │  1.00  │  -17.4%  │
+  └────────────┴──────────┴─────────┴────────┴──────────┘
+  注：LGBM 单模型 Sharpe 高于 Ensemble，主因 Ridge 引入波动（截面相关 0.391）
+      以上为 gross raw return，未做因子调整（见 10.4）
+
+10.4 因子归因（FF3 回归，Newey-West HAC，多空组合）
+  对策略日收益合并成月度收益后回归：
+    excess_ret = alpha + β₁·MktRF + β₂·SMB + β₃·HML + e
+
+  FF3 调整后 alpha（月度）及因子载荷（Ensemble，0 成本）：
+  ┌─────────┬──────────┬──────────┬──────────┬──────────┐
+  │ 因子     │ 系数     │ HAC t值  │ p值      │ 经济含义 │
+  ├─────────┼──────────┼──────────┼──────────┼──────────┤
+  │ alpha   │  1.67%/mo│  3.42    │ 0.0006***│ 年化 20% │
+  │ MktRF   │ -0.334   │ -2.66    │ 0.0079** │ 负市场暴露│
+  │ SMB     │  0.182   │  1.01    │ 0.31     │ 小盘倾向 │
+  │ HML     │ -0.258   │ -1.51    │ 0.13     │ 成长倾向 │
+  └─────────┴──────────┴──────────┴──────────┴──────────┘
+
+  LGBM 单独 FF3 alpha：1.44%/mo（年化 17.33%），t=3.99，p<0.0001
+  Ridge  FF3 alpha：1.58%/mo（年化 18.99%），t=2.70，p=0.007
+
+  关键发现：
+  - 三个模型 FF3 alpha 均显著（p<0.01），策略收益不能被规模/价值因子解释
+  - 负市场 beta（-0.33）说明策略天然低市场暴露，与多空中性设计一致
+  - 负 HML 载荷（成长倾向）：做多高质量成长股，做空价值陷阱
+  - R² 较低（14.8%），FF3 解释力有限，alpha 占主导
+
+10.5 10 bps 交易成本下多空 Sharpe
+  Ridge: 0.59 | LGBM: 1.00 | Ensemble: 0.84
+  信号在实际交易成本下仍保持正 Sharpe
+
+10.6 粗糙度单因子对比
+  ┌──────────────────────┬────────┬──────────┬──────┐
+  │ 信号                  │ IC均值 │ IC标准差 │ ICIR │
+  ├──────────────────────┼────────┼──────────┼──────┤
+  │ Whittle_126d (旧)     │ 0.0039 │  0.0431  │ 0.09 │
+  │ Whittle_252d (旧)     │ 0.0040 │  0.0476  │ 0.08 │
+  │ Idio_Whittle_126d    │ 0.0008 │  0.0293  │ 0.03 │
+  │ Volterra_spread      │-0.0046 │  0.0703  │-0.07 │
+  │ Vol_of_vol_126d      │-0.0089 │  0.0637  │-0.14 │
+  │ GK roughness_126d(新)│ 0.0131 │    —     │  —   │
+  └──────────────────────┴────────┴──────────┴──────┘
+
+10.7 特征重要性 Top 10（LGBM）
+  排名  特征                  重要性
+   1   beta_252d              182
+   2   idio_vol_252d          170
+   3   gross_profitability    159
+   4   ret_120d               157
+   5   revision_1m (分析师)   153
+   6   ret_60d                153
+   7   close_to_ma60          150
+   8   turnover_20d           150
+   9   asset_growth           148
+  10   ret_1d                 147
+
+  注：分析师修正动量 revision_1m 排名第5，是最强的分析师信号
+  粗糙度特征（gk_vol=142, hurst_gk_126d=87）中等重要性
+
+
+十一、工程实现要点
+────────────────────────────────────────────────────────────────────────────────
+
+11.1 点位数据安全（无前视偏差）
+  - 标签：使用累计收益率（(1+ret).cumprod()）而非价格比，正确包含分红和退市收益
+  - DLRET 合并：both-present 时使用 (1+RET)×(1+DLRET)-1 复合，只有 DLRET 时直接用 DLRET
+  - 基本面：使用 rdq + 1 个交易日作为可用日期，排除盘后公告当天的前视偏差
+  - 分析师：STATPERS 严格 < 调仓日
+  - OHLC：每日独立计算 GK，point-in-time merge 取 < 调仓日最近记录
+
+11.2 Python 3.14 时间戳 Segfault 修复
+  问题：pd.to_datetime() 与 pq.read_table().to_pandas() 在 Python 3.14 / macOS 上
+        触发 SIGABRT（exit code 139），Python 进程崩溃
+
+  修复方案：通过 PyArrow 读取后先 cast 为 string，再用 str[:10] 截取
+
+  代码模式：
+    t = pq.read_table(path)
+    # cast all timestamp columns to string before pandas conversion
+    for i, f in enumerate(t.schema):
+        if pa.types.is_timestamp(f.type):
+            t = t.set_column(i, f.name, t.column(f.name).cast(pa.string()))
+    df = t.to_pandas()
+    df["date"] = df["date"].str[:10]  # YYYY-MM-DD string
+
+11.3 分析师数据 Ticker 匹配
+  I/B/E/S 使用 OFTIC（旧 ticker），与 CRSP permno 需通过 Compustat 桥接：
+  IBES OFTIC → Compustat tic → gvkey → permno（via Link Table，LC/LU 类型）
+  匹配率约 70-75%，剩余因 ticker 变更或私有化股票无法匹配
+
+11.4 Git 工作流
+  主分支：main（初始提交，用于 PR 基准）
+  开发分支：dev（所有特征开发和实验在此进行）
+  合并策略：feature branch → dev → PR review → main
+
+
+11.5 统计推断设计
+  - 有效样本为 ~93 个月度 IC 观测，而非百万级 stock-month 行
+  - IC 推断使用 Newey-West HAC（6月 lag），正确处理月度 IC 的时序相关
+  - 训练损失使用 date-balanced sample weights（每只股票权重 = 1/N_stocks_per_date）
+    确保每个月在优化中贡献相同权重，避免大盘月份主导训练
+
+11.6 H 估计改进（WLS 减少 nugget 偏差）
+  - 原 OLS 对 lag 1-10 等权，lag-1 因日度 GK 测量误差存在"nugget"污染，
+    机械压低 H 估计值（H → 0 方向偏移）
+  - 改用 WLS，权重 ∝ lag，上权大 lag（nugget 污染较小），降低偏差
+  - 同时输出每只股票 H 估计的标准误（SE）和 log-log 拟合 R²，用于质量筛选
+  - 注意：日度 GK 测量误差造成的偏差仍无法完全消除，H 值应视为截面排名信号
+    而非精确的粗糙度绝对量
+
+十二、局限性与后续改进方向
+────────────────────────────────────────────────────────────────────────────────
+
+12.1 当前局限（已知且记录）
+
+  (a) 粗糙度信号仍较弱
+      GK roughness 单因子 IC=0.0131，ICIR 未达到 0.5 阈值
+      根本原因：月度调仓频率可能不是提取粗糙度信号的最佳频率
+      BRSS 原文使用日频换仓或更高频交易策略
+
+  (b) 排名模型（LGBMRanker）不稳定
+      2021年严重负 IC（-0.13），可能因为 group 构成在 COVID 后期结构断裂
+      未纳入最终 Ensemble
+
+  (c) 2023 年所有模型 IC 为负
+      市场机制可能发生变化（加息周期末段、AI 主题驱动）
+      模型未包含宏观状态变量
+
+  (d) 测试期 pseudo-OOS 问题
+      研究方案在迭代中多次观察 2016-2023 结果并调整（特征选择、权重）。
+      测试期已被"消费"，无法视为完全独立的样本外发现。
+      真正的 OOS 验证需要 2024+ 数据或 paper trading 正式实验。
+
+  (e) GK 字段语义限制
+      CRSP 的 askhi/bidlo 是报价极值（ask-high/bid-low），而非纯成交 high/low。
+      低流动性股票的 GK 波动估计可能混入 bid-ask spread，
+      hurst_gk 信号部分反映的是市场微结构，而非纯粹的波动粗糙度。
+      OHLC consistency check 在 GK 计算时已记录报告。
+
+  (f) 无高频数据
+      TAQ 数据库（NYSE Milliseconds）存在访问限制（暑期账号限制、23天最大查询范围）
+      未能使用分钟级 OHLC 进行更精细的 Hurst 估计
+
+  (e) 无期权隐含信息
+      校内无 OptionMetrics 订阅，Yahoo/CBOE 无个股历史期权数据
+      无法计算隐含波动率 Hurst（implied_H - realized_H 的粗糙度风险溢价）
+
+12.2 未来改进方向
+
+  (a) 高频数据（若有 TAQ 访问权限）
+      使用 5 分钟 OHLC 计算分钟级 rv，再估计日内 Hurst
+      相邻两天的 Hurst 完全独立，理论上信号质量更高
+
+  (b) 期权隐含 Hurst（Rough Heston 校准）
+      Phase 2 计划：分数 Riccati 方程（Adams-Moulton 方案）
+      Fourier 特征函数反演 → 期权价格 → 校准隐含 H
+      信号：implied_H - realized_H（粗糙度风险溢价）
+      需要 OptionMetrics 学术数据库
+
+  (c) 宏观状态变量
+      加入 VIX 水平、收益率曲线斜率作为择时信号
+      在不同宏观环境下分别评估截面 alpha 稳定性
+
+  (d) 更短调仓周期
+      粗糙度是高频特征，月度调仓可能错过短期效应
+      理论上 1-5 日调仓对粗糙度信号更敏感
+
+  (e) 深度学习替代方案
+      Transformer 处理时序截面面板数据
+      LSTM 替代滚动 OLS 估计 Hurst（端到端学习）
+
+
+十三、文件结构
+────────────────────────────────────────────────────────────────────────────────
+
+  data/
+  ├── raw/
+  │   ├── crsp_daily.parquet           CRSP 日度股票数据
+  │   ├── crsp_ohlc.parquet            CRSP OHLC（37M 行）
+  │   ├── compustat_fundq.parquet      Compustat 季度财务
+  │   ├── crsp_compustat_link.parquet  CRSP-Compustat 链接表
+  │   └── ff_factors_daily.parquet     Fama-French 三因子
+  ├── processed/
+  │   ├── crsp_clean.parquet           清洗后的日度数据
+  │   ├── universe.parquet             每期股票池（date, permno）
+  │   └── labels.parquet               前视超额收益标签
+  └── features/
+      ├── features_price.parquet       价格动量特征
+      ├── features_risk.parquet        风险特征
+      ├── features_fundamental.parquet 基本面特征
+      ├── features_rough_vol.parquet   粗糙度 V1（Whittle + Volterra）
+      ├── features_rough_vol_v2.parquet 粗糙度 V2（Garman-Klass + BRSS）
+      ├── features_analyst.parquet     分析师特征（I/B/E/S）
+      └── features_preprocessed.parquet 合并预处理后的面板
+
+  src/
+  ├── config.py                所有参数、日期范围、特征列表
+  ├── data_loader.py           WRDS 数据拉取
+  ├── universe.py              股票池构建
+  ├── labels.py                标签计算
+  ├── features_price.py        价格动量特征
+  ├── features_risk.py         风险特征
+  ├── features_fundamental.py  基本面特征
+  ├── features_rough_vol.py    粗糙度特征 V1
+  ├── features_rough_vol_v2.py 粗糙度特征 V2（BRSS + GK）
+  ├── features_analyst.py      分析师特征（I/B/E/S）
+  ├── preprocess.py            截面预处理管道
+  ├── models.py                Ridge / LGBM / LGBMRanker 模型封装
+  ├── train.py                 Walk-forward 训练主循环
+  ├── plot_results.py          结果可视化（3张图 + 多空股票列表）
+  └── roughness_factor_test.py 粗糙度单因子 IC 测试
+
+  data/reports/
+  ├── chart1_cumulative_returns.png    累计多空收益图
+  ├── chart2_annual_ic.png             年度 IC 柱状图
+  ├── chart3_decile_monotonicity.png   十分位收益单调性图
+  ├── ic_summary.csv                   IC 汇总统计
+  ├── backtest_summary.csv             各模型回测绩效
+  ├── feature_importance_regressor.csv LGBM 特征重要性
+  ├── roughness_factor_ic.csv          粗糙度单因子 IC 测试结果
+  ├── long_list_2023_10.csv            2023-10 做多股票列表
+  └── short_list_2023_10.csv           2023-10 做空股票列表
+
+
+================================================================================
+撰写日期：2026-06-29
+代码仓库：github.com/[repo] / branch: dev
+================================================================================

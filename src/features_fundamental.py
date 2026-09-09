@@ -3,11 +3,25 @@ Fundamental features from Compustat quarterly data.
 Point-in-time alignment: use rdq + 1 BDay (next trading day after announcement).
 RDQ is a date, not a timestamp — same-day announcements are often post-market.
 Using rdq+1 eliminates the ~1-day look-ahead bias from same-day RDQ.
+
+Date handling: all date columns from raw parquets are YYYY-MM-DD strings.
+pd.to_datetime() and pd.Timestamp arithmetic segfault on Python 3.14/macOS,
+so we use pure-Python datetime.date for any date arithmetic.
 """
+import datetime as _dt
 import pandas as pd
 import numpy as np
-from pandas.tseries.offsets import BDay
 from config import DATA_RAW, DATA_PROCESSED, DATA_FEATURES
+
+
+def _next_bday(date_str) -> str:
+    """Return the next business day (weekday) after date_str as YYYY-MM-DD string."""
+    d = str(date_str)[:10]
+    cur = _dt.date(int(d[:4]), int(d[5:7]), int(d[8:10]))
+    cur += _dt.timedelta(days=1)
+    while cur.weekday() >= 5:  # skip Saturday=5, Sunday=6
+        cur += _dt.timedelta(days=1)
+    return cur.strftime("%Y-%m-%d")
 
 
 def build_point_in_time_fundamentals(
@@ -18,9 +32,9 @@ def build_point_in_time_fundamentals(
     Merge Compustat → CRSP via link table.
     For each (permno, date) pair, find the most recently announced quarterly report.
     """
-    # Valid links only
+    # Valid links only; keep dates as strings (fillna with sentinel string)
     link = link[link["linktype"].isin(["LU", "LC"])].copy()
-    link["linkenddt"] = link["linkenddt"].fillna(pd.Timestamp("2099-12-31"))
+    link["linkenddt"] = link["linkenddt"].fillna("2099-12-31")
 
     # Merge gvkey → permno
     fundq = fundq.merge(link[["gvkey", "permno", "linkdt", "linkenddt"]], on="gvkey", how="inner")
@@ -114,18 +128,28 @@ def merge_fundamentals_to_universe(
         .reset_index(drop=True)
     )
 
-    # date_available = next trading day after rdq:
-    # ensures same-day post-market announcements are not used on signal date.
-    right["date_available"] = right["date_rdq"].apply(lambda d: d + BDay(1))
+    # date_available = next weekday after rdq.
+    right["date_available"] = right["date_rdq"].apply(_next_bday)
+
+    # merge_asof requires numeric keys (not strings).
+    # Convert YYYY-MM-DD strings to integer day ordinals via pure Python (safe on 3.14).
+    left = left.copy()
+    left["date_ord"] = left["date"].apply(
+        lambda s: _dt.date(int(s[:4]), int(s[5:7]), int(s[8:10])).toordinal()
+    )
+    right["date_available_ord"] = right["date_available"].apply(
+        lambda s: _dt.date(int(s[:4]), int(s[5:7]), int(s[8:10])).toordinal()
+    )
 
     result = pd.merge_asof(
-        left,
-        right.sort_values("date_available"),
-        left_on="date",
-        right_on="date_available",
+        left.sort_values("date_ord"),
+        right.sort_values("date_available_ord"),
+        left_on="date_ord",
+        right_on="date_available_ord",
         by="permno",
         direction="backward",
     )
+    result = result.drop(columns=["date_ord", "date_available_ord"])
 
     # Price-based ratios using current mktcap
     mktcap = result["mktcap"].replace(0, np.nan)

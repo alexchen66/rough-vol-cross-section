@@ -27,3 +27,7 @@ build/
 # IDE
 .vscode/
 .idea/
+
+# Claude session dirs & logs
+.claude/
+*run-mcp.txt

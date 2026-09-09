@@ -1,100 +1,105 @@
-# Cross-sectional Rough Volatility Alpha
+# Does Volatility Roughness Price the Cross-Section? A Replication and Post-Mortem
 
-This copy modifies the original project in two ways:
+Cross-sectional US equity study (CRSP/Compustat/IBES via WRDS, 2005–2023,
+~3,200 liquid names per month) testing whether a rough-volatility Hurst
+signal — per Glasserman & He (2020), "Buy Rough, Sell Smooth" — adds
+information to a classic-factor + analyst-revision baseline.
 
-1. Backtest summaries now report `monthly_return` instead of `ann_return`.
-2. `src/visualize_monthly_vs_benchmark.py` creates comparison plots against a local broad-market benchmark proxy.
+**Answer: the standalone factor is real, but it adds nothing to the baseline
+model, and on daily data roughly half of any true roughness signal is
+destroyed by volatility-proxy measurement noise before the model ever sees
+it.** Each claim is tested below.
 
-## Universe
+![Diagnostics](data/figures/roughness_diagnostics.png)
 
-The current universe is not restricted to S&P 500 constituents.
+## Findings
 
-`src/universe.py` builds the stock pool from CRSP daily stocks and keeps NYSE/AMEX/NASDAQ listings (`exchcd` in 1, 2, 3), then applies filters:
+**1. The standalone roughness factor earns a genuine premium.**
+Decile long-short ("buy rough, sell smooth") on `roughness_gk_126d`:
+5.1%/yr gross, FF3 alpha 5.4%/yr (HAC t = 4.5), rank IC 0.013 (t = 5.3),
+n = 218 months, near-zero FF3 loadings (R² = 0.02). It is not a
+volatility or liquidity tilt in disguise: the Fama-MacBeth premium survives
+rv/beta/idio-vol/Amihud/turnover controls at 7.7 bp/mo (t = 3.4), and it
+survives realistic costs (4.0%/yr net at 10 bps round-trip, 44%/mo one-sided
+turnover). It also does not die out of sample: 2016–2023 alpha 4.9%/yr
+(t = 2.4) vs 2005–2015 5.5%/yr (t = 3.7).
 
-- price >= 5
-- 20-day average dollar volume >= 1,000,000
-- listed for at least 252 days
-- not delisted as of the rebalance date
+**2. But it adds zero incremental information to the ML model.**
+Paired monthly IC test, full feature set vs the same pipeline with roughness
+features removed (identical walk-forward windows, 93 OOS months):
+ΔIC = −0.0006 (t = −0.74) for ridge, −0.0033 (t = −1.15) for LGBM.
+The baseline (classic price/fundamental factors + IBES analyst features)
+already spans what the roughness factor captures at portfolio level — a
+5%/yr univariate premium with IC 0.013 is simply too weak to move a model
+whose own IC is 0.026–0.034.
 
-So the universe is closer to a liquid US listed equity universe, not SPY/S&P 500 only.
+**3. Mechanism: daily volatility proxies destroy the signal before estimation.**
+Monte Carlo (`src/hurst_noise_simulation.py`): simulate stocks with known
+heterogeneous H, observe log-vol through proxies of increasing measurement
+noise, re-estimate H with this project's WLS estimator (126d window, lags
+1–10). Rank correlation between true and estimated H:
 
-## Monthly Return
+| volatility proxy | noise var (log-vol) | signal retained |
+|---|---|---|
+| 5-min realized variance | 0.006 | 77% |
+| Garman-Klass daily (theory) | 0.167 | 58% |
+| Garman-Klass on CRSP askhi/bidlo | 0.215 | 53% |
+| squared daily return | 1.234 | 16% |
 
-`src/backtest.py` now computes:
+Two corollaries. (i) BRSS's use of high-frequency realized variance is not
+incidental — the effect is not recoverable at full strength from daily data.
+(ii) The fitted Ĥ ≈ 0.04–0.06 we (and others) obtain on daily data is biased
+far below true H by the noise nugget (simulated mean Ĥ 0.03 vs true 0.14);
+with only 10 lags, nugget and H are barely separately identifiable, so small
+fitted Ĥ on daily data is a noise signature, not independent evidence that
+volatility is rough.
 
-```text
-monthly_return = geometric mean of rebalance-period net returns
+## What I would do differently
+
+Estimate H from intraday realized variance (TAQ / 1-minute bars), which the
+simulation says preserves ~77% of the cross-sectional signal instead of ~53%.
+That requires order-book-scale infrastructure — see the companion
+high-frequency project.
+
+## Pipeline
+
+Point-in-time discipline: fundamentals lagged to the `rdq` announcement date,
+analyst data to `STATPERS`, delisting returns included (survivorship-bias-free
+CRSP universe: price ≥ $5, ADV ≥ $1M, ≥ 252d listed, ~3,200 names/month).
+8-window walk-forward (train/val/test), 20-day embargo, monthly rebalance,
+20-day forward cross-sectionally demeaned labels. Models: ridge, LGBM,
+LGBMRanker, ensemble. Costs charged at 0/5/10/20 bps on turnover.
+
+Baseline OOS results (93 months, 2016–2023): ensemble rank IC 0.035
+(HAC t = 4.5), long-short Sharpe 1.0 gross → 0.84 at 10 bps; FF3 alpha
+20%/yr (t = 3.4). LGBM long-short Sharpe 1.23 gross → 1.0 at 10 bps.
+
+```
+src/
+  universe.py, labels.py            # PIT universe & forward labels
+  features_{price,risk,fundamental,analyst}.py
+  features_rough_vol{,_v2}.py       # Whittle / Volterra / GK-BRSS Hurst
+  train.py, models.py               # walk-forward training
+  backtest.py, monthly_backtest.py, daily_backtest.py
+  evaluation.py, factor_attribution.py
+  roughness_ablation_tests.py       # paired IC, Fama-MacBeth, FF3 spanning  ← start here
+  hurst_noise_simulation.py         # measurement-noise Monte Carlo          ← and here
 ```
 
-Sharpe and Calmar are still kept on the usual annualized scale:
-
-```text
-sharpe = monthly_return * 12 / annualized_volatility
-calmar = monthly_return * 12 / abs(max_drawdown)
-```
-
-## Benchmark
-
-No exact S&P 500 or SPY return file is included in the folder. The visualization script uses the local Fama-French daily market return:
-
-```text
-market_proxy = Mkt-RF + RF
-```
-
-This is a broad US equity market proxy, not the exact S&P 500 index.
-
-## Raw CSV Location
-
-`src/data_loader.py` first looks for raw WRDS CSV files in:
-
-```text
-data/raw/downloads/
-```
-
-If they are not there, it automatically falls back to:
-
-```text
-C:\Users\johnh\Finance\finance project\ML
-```
-
-This avoids copying the large CRSP files into the project folder.
-
-Run Window 8 monthly backtest. Window 8 is the 2023 out-of-sample test period:
+Reproduce the headline tests:
 
 ```bash
-python src/monthly_backtest.py
+python src/roughness_ablation_tests.py   # → data/reports/roughness_ablation_summary.csv
+python src/hurst_noise_simulation.py     # → data/reports/hurst_noise_attenuation.csv
 ```
 
-Run per-model monthly return plots:
+Raw WRDS extracts land in `data/raw/` (see `方案.txt` for the exact
+tables/fields). Requires: pandas, pyarrow, scipy, scikit-learn, lightgbm.
 
-```bash
-python src/visualize_monthly_vs_benchmark.py
-```
+## References
 
-Run Window 8 daily holding-period backtest and daily cumulative plots:
-
-```bash
-python src/daily_backtest.py
-python src/visualize_daily_vs_benchmark.py
-```
-
-Outputs:
-
-- `data/reports/portfolio_monthly_returns_window8.csv`
-- `data/reports/monthly_backtest_summary_window8.csv`
-- `data/figures/monthly_returns_window8_ridge_long_short_fees_vs_market.png`
-- `data/figures/monthly_returns_window8_lgbm_long_short_fees_vs_market.png`
-- `data/figures/monthly_returns_window8_ranker_long_short_fees_vs_market.png`
-- `data/reports/portfolio_daily_returns_window8.csv`
-- `data/figures/daily_cumulative_returns_window8_ridge_long_short_fees_vs_market.png`
-- `data/figures/daily_cumulative_returns_window8_lgbm_long_short_fees_vs_market.png`
-- `data/figures/daily_cumulative_returns_window8_ranker_long_short_fees_vs_market.png`
-
-Each figure contains one ML model, several transaction-fee lines, and the
-market benchmark proxy line. The plots require `data/processed/predictions.parquet`
-and `data/processed/labels.parquet`; if `portfolio_monthly_returns_window8.csv` is not
-present, the plotting script will automatically run `src/monthly_backtest.py`.
-
-For daily charts, signals remain monthly. The daily backtest expands each
-monthly portfolio into the next 20 CRSP trading days and computes daily
-portfolio returns while charging transaction costs on each rebalance entry day.
+- Glasserman & He (2020), *Buy Rough, Sell Smooth*, Quantitative Finance.
+- Gatheral, Jaisson & Rosenbaum (2018), *Volatility is Rough*, Quantitative Finance.
+- Fukasawa, Takabatake & Westphal (2022), *Is Volatility Rough?* — on H
+  inference under proxy noise.
+- Bailey & López de Prado (2014), *The Deflated Sharpe Ratio*.
